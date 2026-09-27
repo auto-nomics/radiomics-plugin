@@ -1,0 +1,793 @@
+schema_version = 1
+plugin_name = "radiomics"
+
+[image]
+reference = "ghcr.io/auto-nomics/autonomics/pyradiomics@sha256:bccbe15b2ec8d079e1bf869c4f06bfe4143642015394453c584dc981e5403fbe"
+tag = "3.1.0-r2"
+upstream = "AIM-Harvard PyRadiomics 3.1.0 on python:3.11.11-slim (SimpleITK 2.3.1, pydicom 2.4.4, scikit-image 0.22.0) + autonomics radiomics_runner.py"
+license = "BSD-3-Clause"
+
+# Family-wide conventions (see README.md for the full parity notes):
+#
+# - The legacy Rust wrapper passed one JSON settings blob per variant in a
+#   single `RADIOMICS_*_SETTINGS` environment variable. The v0 env template
+#   surface cannot build that blob (no JSON arrays, no null for absent
+#   optionals, no string escaping), so every script receives its params as
+#   individual typed `RADIOMICS_*` env vars and rebuilds the blob with
+#   `json.dumps` before exec-ing the pinned runner command. The runner sees
+#   the same JSON document the Rust `serde_json::json!` macro produced.
+# - Number lists (`log_sigmas`, `volume_fractions`, `max_iterations`,
+#   `resampled_spacing`, `resegment_range`) have no array-of-numbers param
+#   type; they travel as space-separated strings, mirroring the deseq2
+#   covariates precedent. The script splits and type-checks them.
+# - Cross-field rules the manifest bounds cannot carry (membership checks,
+#   ordering, requires-style gates) are re-enforced in the scripts with the
+#   legacy error messages, per the deseq2 migration precedent.
+# - No variant requests GPUs or any non-default resources: the legacy
+#   `base_spec` pinned `gpus: None`, isolated network, read-only rootfs,
+#   and pull-on-missing, so every node omits `[nodes.resources]` and keeps
+#   the hardened defaults.
+
+[[nodes]]
+kind = "radiomics_image_ingest"
+desc = "Normalizes NIfTI, MHA, or a DICOM series to MHA."
+doc = """
+Reads one NIfTI/MHA file or a DICOM-series FileSet, writes a normalized
+MHA image, and records geometry plus source hashes.
+"""
+timeout_secs = 3600
+artifact_prefix = "/artifacts/radiomics_image_ingest"
+
+[nodes.ports]
+inputs = [{ type = "file" }]
+outputs = [
+  { path = "image.mha", format = "mha" },
+  { path = "image_meta.json", format = "json" },
+]
+
+[nodes.params]
+z_sort = { type = "string", default = "position", doc = "DICOM series sort key: lexical, instance_number, or position (the runner validates the value)" }
+z_direction = { type = "string", default = "ascending", doc = "DICOM series sort direction: ascending or descending (the runner validates the value)" }
+
+[nodes.command]
+interpreter = "sh"
+script_file = "scripts/image_ingest.sh"
+
+[nodes.command.env]
+RADIOMICS_Z_SORT = "{{ z_sort }}"
+RADIOMICS_Z_DIRECTION = "{{ z_direction }}"
+
+[[nodes]]
+kind = "radiomics_mask_ingest"
+desc = "Normalizes a voxel mask or converts RTSTRUCT against a reference image."
+doc = """
+Input port 0 is the reference image and input port 1 is the mask. Reads a
+NIfTI/MHA mask or rasterizes a DICOM RTSTRUCT against the reference.
+Outputs a normalized MHA mask and ROI metadata.
+"""
+timeout_secs = 3600
+artifact_prefix = "/artifacts/radiomics_mask_ingest"
+
+[nodes.ports]
+inputs = [
+  { type = "file", label = "reference_image" },
+  { type = "file", label = "mask_or_rtstruct" },
+]
+outputs = [
+  { path = "mask.mha", format = "mha" },
+  { path = "roi_meta.json", format = "json" },
+]
+
+[nodes.params]
+roi_name = { type = "string", optional = true, doc = "Exact DICOM RTSTRUCT ROIName; the first ROI is used when omitted" }
+z_sort = { type = "string", default = "position", doc = "DICOM series sort key: lexical, instance_number, or position (the runner validates the value)" }
+z_direction = { type = "string", default = "ascending", doc = "DICOM series sort direction: ascending or descending (the runner validates the value)" }
+
+[nodes.command]
+interpreter = "sh"
+script_file = "scripts/mask_ingest.sh"
+
+[nodes.command.env]
+RADIOMICS_ROI_NAME = "{{ roi_name }}"
+RADIOMICS_Z_SORT = "{{ z_sort }}"
+RADIOMICS_Z_DIRECTION = "{{ z_direction }}"
+
+[[nodes]]
+kind = "radiomics_pair_validate"
+desc = "Validates image/mask geometry and ROI voxel count."
+doc = """
+Checks image/mask dimension, spacing, origin, direction, label presence,
+and minimum ROI voxel count. Invalid pairs are reported in the validation
+table rather than silently dropped.
+"""
+timeout_secs = 3600
+artifact_prefix = "/artifacts/radiomics_pair_validate"
+
+[nodes.ports]
+inputs = [{ type = "file" }, { type = "file" }]
+outputs = [
+  { path = "pair_validation.parquet", format = "parquet" },
+  { path = "geometry.json", format = "json" },
+]
+
+[nodes.params]
+extraction_id = { type = "string", doc = "Extraction unit identifier recorded in the validation table" }
+mask_label = { type = "int", default = 1, min = 1.0, doc = "Positive mask label that marks the ROI" }
+minimum_mask_voxels = { type = "int", default = 1, min = 0.0, doc = "Minimum acceptable ROI voxel count" }
+geometry_tolerance_mm = { type = "number", default = 0.01, min = 0.0, doc = "Tolerated spacing/origin mismatch in millimeters" }
+
+[nodes.command]
+interpreter = "sh"
+script_file = "scripts/pair_validate.sh"
+
+[nodes.command.env]
+RADIOMICS_EXTRACTION_ID = "{{ extraction_id }}"
+RADIOMICS_MASK_LABEL = "{{ mask_label }}"
+RADIOMICS_MINIMUM_MASK_VOXELS = "{{ minimum_mask_voxels }}"
+RADIOMICS_GEOMETRY_TOLERANCE_MM = "{{ geometry_tolerance_mm }}"
+
+[[nodes]]
+kind = "radiomics_preprocess"
+desc = "Applies deterministic radiomics preprocessing."
+doc = """
+Applies explicit deterministic resampling, intensity resegmentation, and
+within-image ROI normalization. No cohort-fitted transform is estimated.
+"""
+timeout_secs = 3600
+artifact_prefix = "/artifacts/radiomics_preprocess"
+
+[nodes.ports]
+inputs = [{ type = "file" }, { type = "file" }]
+outputs = [
+  { path = "image.mha", format = "mha" },
+  { path = "mask.mha", format = "mha" },
+  { path = "preprocess_meta.json", format = "json" },
+]
+
+[nodes.params]
+resampled_spacing = { type = "string", optional = true, doc = "Desired isotropic or anisotropic spacing in millimeters as three space-separated positive numbers, for example: 1.0 1.0 1.0" }
+interpolator = { type = "string", default = "sitkBSpline", doc = "SimpleITK interpolator name, for example sitkBSpline" }
+resegment_range = { type = "string", optional = true, doc = "Inclusive intensity resegmentation range applied to the mask as two space-separated numbers: low high" }
+normalize = { type = "bool", default = false, doc = "Z-score the image inside the ROI after resampling" }
+
+[nodes.command]
+interpreter = "sh"
+script_file = "scripts/preprocess.sh"
+
+[nodes.command.env]
+RADIOMICS_RESAMPLED_SPACING = "{{ resampled_spacing }}"
+RADIOMICS_INTERPOLATOR = "{{ interpolator }}"
+RADIOMICS_RESEGMENT_RANGE = "{{ resegment_range }}"
+RADIOMICS_NORMALIZE = "{{ normalize }}"
+
+[[nodes]]
+kind = "pyradiomics_extract"
+desc = "Extracts PyRadiomics features for one image/mask pair."
+doc = """
+Runs official PyRadiomics 3.1.0 for one extraction unit and emits wide
+features, long features, metadata, diagnostics, and provenance. Feature
+columns use normalized lowercase IDs, for example original_shape_elongation;
+metadata retains exact PyRadiomics CamelCase names.
+"""
+timeout_secs = 3600
+artifact_prefix = "/artifacts/pyradiomics_extract"
+
+[nodes.ports]
+inputs = [{ type = "file" }, { type = "file" }]
+outputs = [
+  { path = "features_wide.parquet", format = "parquet" },
+  { path = "features_long.parquet", format = "parquet" },
+  { path = "feature_metadata.parquet", format = "parquet" },
+  { path = "diagnostics.parquet", format = "parquet" },
+  { path = "provenance.json", format = "json" },
+]
+
+[nodes.params]
+extraction_id = { type = "string", doc = "Extraction unit identifier" }
+patient_id = { type = "string", doc = "Patient identifier recorded in the feature tables" }
+image_id = { type = "string", doc = "Image identifier recorded in the feature tables" }
+roi_id = { type = "string", doc = "ROI identifier recorded in the feature tables" }
+roi_name = { type = "string", optional = true, doc = "ROI display name; null when the mask carries no name" }
+modality = { type = "string", doc = "Imaging modality, for example CT or MR" }
+preset_id = { type = "string", doc = "Preset identifier, for example pyradiomics_original_v1" }
+mask_label = { type = "int", default = 1, min = 1.0, doc = "Positive mask label that marks the ROI" }
+bin_width = { type = "number", default = 25.0, exclusive_min = 0.0, doc = "Fixed histogram bin width" }
+resampled_spacing = { type = "string", optional = true, doc = "Three space-separated positive spacings in millimeters to resample to before extraction" }
+force2d = { type = "bool", default = false, doc = "Extract 2D features slice by slice instead of volumetrically" }
+force2d_dimension = { type = "int", default = 0, max = 255.0, doc = "Axis along which force2d operates (0, 1, or 2)" }
+image_types = { type = "string_array", default = ["Original"], doc = "PyRadiomics image types to enable; supported: Original, LoG, Wavelet, Square, SquareRoot, Logarithm, Exponential, Gradient, LBP2D, LBP3D" }
+feature_classes = { type = "string_array", default = ["shape", "firstorder", "glcm", "glrlm", "glszm", "gldm", "ngtdm"], doc = "PyRadiomics feature classes to enable; PyRadiomics 3.1 supports shape, shape2D, firstorder, glcm, glrlm, glszm, gldm, ngtdm (NGLDM is not available)" }
+log_sigmas = { type = "string", default = "2 3 4 5", doc = "LoG kernel sigmas in millimeters as space-separated positive numbers; ignored unless LoG is enabled" }
+
+[nodes.command]
+interpreter = "sh"
+script_file = "scripts/extract.sh"
+
+[nodes.command.env]
+RADIOMICS_EXTRACTION_ID = "{{ extraction_id }}"
+RADIOMICS_PATIENT_ID = "{{ patient_id }}"
+RADIOMICS_IMAGE_ID = "{{ image_id }}"
+RADIOMICS_ROI_ID = "{{ roi_id }}"
+RADIOMICS_ROI_NAME = "{{ roi_name }}"
+RADIOMICS_MODALITY = "{{ modality }}"
+RADIOMICS_PRESET_ID = "{{ preset_id }}"
+RADIOMICS_MASK_LABEL = "{{ mask_label }}"
+RADIOMICS_BIN_WIDTH = "{{ bin_width }}"
+RADIOMICS_RESAMPLED_SPACING = "{{ resampled_spacing }}"
+RADIOMICS_FORCE2D = "{{ force2d }}"
+RADIOMICS_FORCE2D_DIMENSION = "{{ force2d_dimension }}"
+RADIOMICS_IMAGE_TYPES = "{{ image_types }}"
+RADIOMICS_FEATURE_CLASSES = "{{ feature_classes }}"
+RADIOMICS_LOG_SIGMAS = "{{ log_sigmas }}"
+
+[[nodes]]
+kind = "pyradiomics_batch_extract"
+desc = "Extracts PyRadiomics features from ordered manifest FileSets."
+doc = """
+Runs official PyRadiomics 3.1.0 over ordered image and mask FileSets plus a
+CSV/Parquet manifest. One failed extraction does not discard the cohort.
+Feature columns use normalized lowercase IDs, for example
+original_shape_elongation; metadata retains exact PyRadiomics CamelCase
+names.
+"""
+timeout_secs = 3600
+artifact_prefix = "/artifacts/pyradiomics_batch_extract"
+
+[nodes.ports]
+inputs = [{ type = "file" }, { type = "file" }, { type = "file" }]
+outputs = [
+  { path = "features_wide.parquet", format = "parquet" },
+  { path = "features_long.parquet", format = "parquet" },
+  { path = "feature_metadata.parquet", format = "parquet" },
+  { path = "diagnostics.parquet", format = "parquet" },
+  { path = "provenance.json", format = "json" },
+]
+
+[nodes.params]
+valid_only = { type = "bool", default = true, doc = "Skip manifest rows with status != valid" }
+mask_label = { type = "int", default = 1, min = 1.0, doc = "Positive mask label that marks the ROI" }
+bin_width = { type = "number", default = 25.0, exclusive_min = 0.0, doc = "Fixed histogram bin width" }
+resampled_spacing = { type = "string", optional = true, doc = "Three space-separated positive spacings in millimeters to resample to before extraction" }
+force2d = { type = "bool", default = false, doc = "Extract 2D features slice by slice instead of volumetrically" }
+force2d_dimension = { type = "int", default = 0, max = 255.0, doc = "Axis along which force2d operates (0, 1, or 2)" }
+image_types = { type = "string_array", default = ["Original"], doc = "PyRadiomics image types to enable; supported: Original, LoG, Wavelet, Square, SquareRoot, Logarithm, Exponential, Gradient, LBP2D, LBP3D" }
+feature_classes = { type = "string_array", default = ["shape", "firstorder", "glcm", "glrlm", "glszm", "gldm", "ngtdm"], doc = "PyRadiomics feature classes to enable; PyRadiomics 3.1 supports shape, shape2D, firstorder, glcm, glrlm, glszm, gldm, ngtdm (NGLDM is not available)" }
+log_sigmas = { type = "string", default = "2 3 4 5", doc = "LoG kernel sigmas in millimeters as space-separated positive numbers; ignored unless LoG is enabled" }
+
+[nodes.command]
+interpreter = "sh"
+script_file = "scripts/batch_extract.sh"
+
+[nodes.command.env]
+RADIOMICS_VALID_ONLY = "{{ valid_only }}"
+RADIOMICS_MASK_LABEL = "{{ mask_label }}"
+RADIOMICS_BIN_WIDTH = "{{ bin_width }}"
+RADIOMICS_RESAMPLED_SPACING = "{{ resampled_spacing }}"
+RADIOMICS_FORCE2D = "{{ force2d }}"
+RADIOMICS_FORCE2D_DIMENSION = "{{ force2d_dimension }}"
+RADIOMICS_IMAGE_TYPES = "{{ image_types }}"
+RADIOMICS_FEATURE_CLASSES = "{{ feature_classes }}"
+RADIOMICS_LOG_SIGMAS = "{{ log_sigmas }}"
+
+[[nodes]]
+kind = "radiomics_dicom_metadata"
+desc = "Extracts clinical, acquisition, reconstruction, and dose DICOM metadata."
+doc = """
+Reads one DICOM File or a DICOM FileSet, emits one Parquet row per
+instance, and supports extra keywords or `(group,element)` tags.
+Acquisition, reconstruction, and common dose tags are included in the
+standard field set.
+"""
+timeout_secs = 3600
+artifact_prefix = "/artifacts/radiomics_dicom_metadata"
+
+[nodes.ports]
+inputs = [{ type = "file" }]
+outputs = [
+  { path = "dicom_metadata.parquet", format = "parquet" },
+  { path = "dicom_metadata_report.json", format = "json" },
+]
+
+[nodes.params]
+extra_tags = { type = "string_array", default = [], doc = "Additional DICOM keywords or (group,element) tags" }
+
+[nodes.command]
+interpreter = "sh"
+script_file = "scripts/dicom_metadata.sh"
+
+[nodes.command.env]
+RADIOMICS_EXTRA_TAGS = "{{ extra_tags }}"
+
+[[nodes]]
+kind = "radiomics_phi_scrub"
+desc = "Removes PHI from DICOM datasets and emits an audit report."
+doc = """
+Reads one DICOM File or FileSet, recursively removes identifying elements
+including person-name VR values, optionally replaces PatientID/PatientName
+with a pseudonym, and returns a DICOM ZIP plus per-file and summary audit
+reports.
+"""
+timeout_secs = 3600
+artifact_prefix = "/artifacts/radiomics_phi_scrub"
+
+[nodes.ports]
+inputs = [{ type = "file" }]
+outputs = [
+  { path = "scrubbed_dicom.zip", format = "dicom_zip" },
+  { path = "phi_scrub_report.parquet", format = "parquet" },
+  { path = "phi_scrub_report.json", format = "json" },
+]
+
+[nodes.params]
+keep_patient_id = { type = "bool", default = false, doc = "Retain a pseudonymized PatientID instead of deleting it" }
+pseudonym = { type = "string", optional = true, doc = "Replacement value for PatientID/PatientName; requires keep_patient_id=true (the script enforces this)" }
+
+[nodes.command]
+interpreter = "sh"
+script_file = "scripts/phi_scrub.sh"
+
+[nodes.command.env]
+RADIOMICS_KEEP_PATIENT_ID = "{{ keep_patient_id }}"
+RADIOMICS_PSEUDONYM = "{{ pseudonym }}"
+
+[[nodes]]
+kind = "radiomics_voi_dice_hausdorff"
+desc = "Computes Dice, Jaccard, Hausdorff, and surface Dice for two masks."
+doc = """
+Input port 0 is the reference mask and port 1 the comparison mask. Both
+use the configured positive label and must share geometry. Emits Dice,
+Jaccard, volume similarity, directed and symmetric Hausdorff distances,
+and tolerance-based surface Dice.
+"""
+timeout_secs = 3600
+artifact_prefix = "/artifacts/radiomics_voi_dice_hausdorff"
+
+[nodes.ports]
+inputs = [{ type = "file" }, { type = "file" }]
+outputs = [
+  { path = "voi_similarity.parquet", format = "parquet" },
+  { path = "voi_similarity.json", format = "json" },
+]
+
+[nodes.params]
+comparison_id = { type = "string", doc = "Comparison identifier recorded in the result tables" }
+mask_label = { type = "int", default = 1, min = 1.0, doc = "Positive mask label evaluated in both masks" }
+surface_tolerance_mm = { type = "number", default = 1.0, min = 0.0, doc = "Tolerance for the surface Dice metric in millimeters" }
+
+[nodes.command]
+interpreter = "sh"
+script_file = "scripts/voi_similarity.sh"
+
+[nodes.command.env]
+RADIOMICS_COMPARISON_ID = "{{ comparison_id }}"
+RADIOMICS_MASK_LABEL = "{{ mask_label }}"
+RADIOMICS_SURFACE_TOLERANCE_MM = "{{ surface_tolerance_mm }}"
+
+[[nodes]]
+kind = "radiomics_image_qc"
+desc = "Computes ROI/background SNR, CNR, uniformity, and slice completeness."
+doc = """
+Inputs are image, ROI mask, and background mask. Emits foreground/background
+intensity statistics, SNR, CNR, ROI coefficient of variation, active and
+zero-variance slice counts, and interior ROI gaps.
+"""
+timeout_secs = 3600
+artifact_prefix = "/artifacts/radiomics_image_qc"
+
+[nodes.ports]
+inputs = [{ type = "file" }, { type = "file" }, { type = "file" }]
+outputs = [
+  { path = "image_qc.parquet", format = "parquet" },
+  { path = "image_qc.json", format = "json" },
+]
+
+[nodes.params]
+extraction_id = { type = "string", doc = "Extraction unit identifier recorded in the QC tables" }
+mask_label = { type = "int", default = 1, min = 1.0, doc = "Positive mask label that marks the ROI" }
+
+[nodes.command]
+interpreter = "sh"
+script_file = "scripts/image_qc.sh"
+
+[nodes.command.env]
+RADIOMICS_EXTRACTION_ID = "{{ extraction_id }}"
+RADIOMICS_MASK_LABEL = "{{ mask_label }}"
+
+[[nodes]]
+kind = "radiomics_rtstruct_geometry"
+desc = "Profiles RTSTRUCT contour geometry against a reference image."
+doc = """
+Input port 0 is an RTSTRUCT File and port 1 a reference image File/FileSet.
+Emits ROI contour counts, point counts, geometric types, slice spacing,
+finite-point checks, and reference-bounds checks.
+"""
+timeout_secs = 3600
+artifact_prefix = "/artifacts/radiomics_rtstruct_geometry"
+
+[nodes.ports]
+inputs = [{ type = "file" }, { type = "file" }]
+outputs = [
+  { path = "rtstruct_geometry.parquet", format = "parquet" },
+  { path = "rtstruct_geometry.json", format = "json" },
+]
+
+[nodes.params]
+roi_name = { type = "string", optional = true, doc = "Exact RTSTRUCT ROIName; every ROI is profiled when omitted" }
+
+[nodes.command]
+interpreter = "sh"
+script_file = "scripts/rtstruct_geometry.sh"
+
+[nodes.command.env]
+RADIOMICS_ROI_NAME = "{{ roi_name }}"
+
+[[nodes]]
+kind = "radiomics_ivh_extract"
+desc = "Extracts intensity-volume histogram values for one ROI."
+doc = """
+Computes cumulative intensity-volume histogram intensities at configured
+volume fractions for one image/mask pair.
+"""
+timeout_secs = 3600
+artifact_prefix = "/artifacts/radiomics_ivh_extract"
+
+[nodes.ports]
+inputs = [{ type = "file" }, { type = "file" }]
+outputs = [
+  { path = "ivh.parquet", format = "parquet" },
+  { path = "ivh.json", format = "json" },
+]
+
+[nodes.params]
+extraction_id = { type = "string", doc = "Extraction unit identifier recorded in the IVH tables" }
+mask_label = { type = "int", default = 1, min = 1.0, doc = "Positive mask label that marks the ROI" }
+volume_fractions = { type = "string", default = "0.05 0.1 0.15 0.2 0.25 0.3 0.35 0.4 0.45 0.5 0.55 0.6 0.65 0.7 0.75 0.8 0.85 0.9 0.95", doc = "Cumulative volume fractions in (0, 1] as space-separated numbers; the script rejects values outside the range" }
+
+[nodes.command]
+interpreter = "sh"
+script_file = "scripts/ivh.sh"
+
+[nodes.command.env]
+RADIOMICS_EXTRACTION_ID = "{{ extraction_id }}"
+RADIOMICS_MASK_LABEL = "{{ mask_label }}"
+RADIOMICS_VOLUME_FRACTIONS = "{{ volume_fractions }}"
+
+[[nodes]]
+kind = "radiomics_shape_topology"
+desc = "Extracts mask topology, principal axes, and per-slice geometry."
+doc = """
+Computes connected components, Euler number and hole estimate,
+largest-component fraction, physical centroid and principal-axis ratios,
+and a per-slice area/perimeter/diameter profile.
+"""
+timeout_secs = 3600
+artifact_prefix = "/artifacts/radiomics_shape_topology"
+
+[nodes.ports]
+inputs = [{ type = "file" }]
+outputs = [
+  { path = "shape_topology.parquet", format = "parquet" },
+  { path = "slice_profile.parquet", format = "parquet" },
+  { path = "shape_topology.json", format = "json" },
+]
+
+[nodes.params]
+extraction_id = { type = "string", doc = "Extraction unit identifier recorded in the topology tables" }
+mask_label = { type = "int", default = 1, min = 1.0, doc = "Positive mask label that marks the ROI" }
+
+[nodes.command]
+interpreter = "sh"
+script_file = "scripts/shape_topology.sh"
+
+[nodes.command.env]
+RADIOMICS_EXTRACTION_ID = "{{ extraction_id }}"
+RADIOMICS_MASK_LABEL = "{{ mask_label }}"
+
+[[nodes]]
+kind = "radiomics_register"
+desc = "Registers a moving image to a fixed image."
+doc = """
+Runs SimpleITK centered rigid or affine registration with Mattes mutual
+information, emits the resampled moving image, transform, optimizer
+metric, and provenance.
+"""
+timeout_secs = 3600
+artifact_prefix = "/artifacts/radiomics_register"
+
+[nodes.ports]
+inputs = [{ type = "file" }, { type = "file" }]
+outputs = [
+  { path = "registered.mha", format = "mha" },
+  { path = "transform.tfm", format = "simpleitk_transform" },
+  { path = "registration.json", format = "json" },
+]
+
+[nodes.params]
+transform_type = { type = "string", default = "rigid", doc = "rigid or affine; the script rejects any other value" }
+iterations = { type = "int", default = 100, min = 1.0, doc = "Optimizer iteration cap" }
+learning_rate = { type = "number", default = 1.0, exclusive_min = 0.0, doc = "Optimizer learning rate" }
+sampling_percent = { type = "number", default = 0.15, min = 0.0, max = 1.0, doc = "Fraction of voxels used for metric estimation" }
+
+[nodes.command]
+interpreter = "sh"
+script_file = "scripts/register.sh"
+
+[nodes.command.env]
+RADIOMICS_TRANSFORM_TYPE = "{{ transform_type }}"
+RADIOMICS_ITERATIONS = "{{ iterations }}"
+RADIOMICS_LEARNING_RATE = "{{ learning_rate }}"
+RADIOMICS_SAMPLING_PERCENT = "{{ sampling_percent }}"
+
+[[nodes]]
+kind = "radiomics_delta_features"
+desc = "Computes baseline-to-followup feature changes from a wide feature table."
+doc = """
+Reads a CSV/Parquet wide feature table and pairs configured
+baseline/followup rows by patient ID. Emits absolute, relative, and
+percent feature changes plus unresolved-patient diagnostics.
+"""
+timeout_secs = 3600
+artifact_prefix = "/artifacts/radiomics_delta_features"
+
+[nodes.ports]
+inputs = [{ type = "file" }]
+outputs = [
+  { path = "delta_features.parquet", format = "parquet" },
+  { path = "delta_features_report.json", format = "json" },
+]
+
+[nodes.params]
+id_column = { type = "string", default = "patient_id", doc = "Patient identifier column" }
+timepoint_column = { type = "string", default = "timepoint", doc = "Timepoint label column" }
+baseline = { type = "string", default = "baseline", doc = "Baseline timepoint label; must differ from followup" }
+followup = { type = "string", default = "followup", doc = "Followup timepoint label; must differ from baseline" }
+
+[nodes.command]
+interpreter = "sh"
+script_file = "scripts/delta_features.sh"
+
+[nodes.command.env]
+RADIOMICS_ID_COLUMN = "{{ id_column }}"
+RADIOMICS_TIMEPOINT_COLUMN = "{{ timepoint_column }}"
+RADIOMICS_BASELINE = "{{ baseline }}"
+RADIOMICS_FOLLOWUP = "{{ followup }}"
+
+[[nodes]]
+kind = "radiomics_bias_correct"
+desc = "Applies mask-guided N4 bias-field correction."
+doc = """
+Runs SimpleITK N4 inhomogeneity correction guided by the ROI mask,
+down-sampled by a configurable shrink factor for speed. Emits the
+corrected image, the reconstructed full-resolution bias field for QC, and
+convergence metadata.
+"""
+timeout_secs = 3600
+artifact_prefix = "/artifacts/radiomics_bias_correct"
+
+[nodes.ports]
+inputs = [{ type = "file" }, { type = "file" }]
+outputs = [
+  { path = "corrected.mha", format = "mha" },
+  { path = "bias_field.mha", format = "mha" },
+  { path = "bias_meta.json", format = "json" },
+]
+
+[nodes.params]
+mask_label = { type = "int", default = 1, min = 1.0, doc = "Positive mask label that confines N4 fitting" }
+shrink_factor = { type = "int", default = 4, min = 1.0, max = 8.0, doc = "Isotropic down-sampling factor for the fit; 1 runs at full resolution" }
+max_iterations = { type = "string", default = "50 50 50 50", doc = "Per-level iteration caps for the N4 multi-resolution scheme as 1-8 space-separated positive integers" }
+convergence_threshold = { type = "number", default = 1e-6, exclusive_min = 0.0, doc = "N4 convergence threshold" }
+
+[nodes.command]
+interpreter = "sh"
+script_file = "scripts/bias_correct.sh"
+
+[nodes.command.env]
+RADIOMICS_MASK_LABEL = "{{ mask_label }}"
+RADIOMICS_SHRINK_FACTOR = "{{ shrink_factor }}"
+RADIOMICS_MAX_ITERATIONS = "{{ max_iterations }}"
+RADIOMICS_CONVERGENCE_THRESHOLD = "{{ convergence_threshold }}"
+
+[[nodes]]
+kind = "radiomics_robust_normalize"
+desc = "Applies percentile-truncated robust z-score normalization."
+doc = """
+Computes winsorization bounds at configured percentiles of the
+tissue-mask intensity distribution, z-scores the whole image with the
+winsorized mean and standard deviation, and records every fitted
+parameter. No cohort-level statistics are involved.
+"""
+timeout_secs = 3600
+artifact_prefix = "/artifacts/radiomics_robust_normalize"
+
+[nodes.ports]
+inputs = [{ type = "file" }, { type = "file" }]
+outputs = [
+  { path = "normalized.mha", format = "mha" },
+  { path = "normalize_meta.json", format = "json" },
+]
+
+[nodes.params]
+mask_label = { type = "int", default = 1, min = 1.0, doc = "Mask label whose voxels define the intensity statistics" }
+lower_percentile = { type = "number", default = 1.0, min = 0.0, max = 100.0, doc = "Lower winsorization percentile over the tissue mask; must be below upper_percentile" }
+upper_percentile = { type = "number", default = 99.0, min = 0.0, max = 100.0, doc = "Upper winsorization percentile over the tissue mask; must be above lower_percentile" }
+
+[nodes.command]
+interpreter = "sh"
+script_file = "scripts/robust_normalize.sh"
+
+[nodes.command.env]
+RADIOMICS_MASK_LABEL = "{{ mask_label }}"
+RADIOMICS_LOWER_PERCENTILE = "{{ lower_percentile }}"
+RADIOMICS_UPPER_PERCENTILE = "{{ upper_percentile }}"
+
+[[nodes]]
+kind = "radiomics_peritumoral_ring"
+desc = "Builds an anatomically constrained peritumoral ring mask."
+doc = """
+Dilates the tumor mask by physical radii (a ball footprint built from the
+image spacing) and subtracts tumor and an exclusion mask, yielding a
+ring-only mask, a tumor=1/ring=2 labeled mask, a combined mask, and
+volume accounting including exclusion removals.
+"""
+timeout_secs = 3600
+artifact_prefix = "/artifacts/radiomics_peritumoral_ring"
+
+[nodes.ports]
+inputs = [{ type = "file" }, { type = "file" }, { type = "file" }]
+outputs = [
+  { path = "mask_ring.mha", format = "mha" },
+  { path = "mask_tumor_ring.mha", format = "mha" },
+  { path = "mask_combined.mha", format = "mha" },
+  { path = "ring_meta.json", format = "json" },
+]
+
+[nodes.params]
+mask_label = { type = "int", default = 1, min = 1.0, doc = "Positive tumor label inside the mask input" }
+inner_mm = { type = "number", default = 0.0, min = 0.0, max = 50.0, doc = "Inner ring radius in millimeters; 0 grows the ring from the tumor edge; must be below outer_mm" }
+outer_mm = { type = "number", default = 5.0, min = 0.0, max = 50.0, doc = "Outer ring radius in millimeters; must be above inner_mm" }
+
+[nodes.command]
+interpreter = "sh"
+script_file = "scripts/peritumoral_ring.sh"
+
+[nodes.command.env]
+RADIOMICS_MASK_LABEL = "{{ mask_label }}"
+RADIOMICS_INNER_MM = "{{ inner_mm }}"
+RADIOMICS_OUTER_MM = "{{ outer_mm }}"
+
+[[nodes]]
+kind = "radiomics_habitat_fit"
+desc = "Fits common intratumoral habitat centers."
+doc = """
+Reads a manifest of cases with co-registered multi-parametric channel
+images, draws an equal-size seeded voxel sample per case, z-scores
+channels per case, pools the samples, and fits deterministic k-means
+habitat centers. Labels are frozen by descending first-channel center so
+habitats are comparable across folds.
+"""
+timeout_secs = 3600
+artifact_prefix = "/artifacts/radiomics_habitat_fit"
+
+[nodes.ports]
+inputs = [{ type = "file" }, { type = "file" }, { type = "file" }]
+outputs = [
+  { path = "habitats.json", format = "json" },
+  { path = "habitat_fit_samples.parquet", format = "parquet" },
+]
+
+[nodes.params]
+mask_label = { type = "int", default = 1, min = 1.0, doc = "Positive tumor label inside each mask" }
+n_habitats = { type = "int", default = 3, min = 2.0, max = 6.0, doc = "Number of habitats" }
+sample_voxels_per_case = { type = "int", default = 10000, min = 100.0, doc = "Equal per-case voxel sample budget for the pooled fit" }
+seed = { type = "int", default = 0, min = 0.0, doc = "Seed fixing k-means++ restarts and per-case sampling" }
+standardize = { type = "bool", default = true, doc = "Z-score each case's channels before pooling" }
+n_init = { type = "int", default = 8, min = 1.0, max = 50.0, doc = "Seeded restarts of Lloyd's algorithm; best inertia wins" }
+max_iter = { type = "int", default = 300, min = 1.0, doc = "Maximum Lloyd iterations per restart" }
+
+[nodes.command]
+interpreter = "sh"
+script_file = "scripts/habitat_fit.sh"
+
+[nodes.command.env]
+RADIOMICS_MASK_LABEL = "{{ mask_label }}"
+RADIOMICS_N_HABITATS = "{{ n_habitats }}"
+RADIOMICS_SAMPLE_VOXELS_PER_CASE = "{{ sample_voxels_per_case }}"
+RADIOMICS_SEED = "{{ seed }}"
+RADIOMICS_STANDARDIZE = "{{ standardize }}"
+RADIOMICS_N_INIT = "{{ n_init }}"
+RADIOMICS_MAX_ITER = "{{ max_iter }}"
+
+[[nodes]]
+kind = "radiomics_habitat_assign"
+desc = "Assigns tumor voxels to frozen habitat centers."
+doc = """
+Input port 0 is the tumor mask, port 1 the channel FileSet, port 2 the
+frozen habitats.json from habitat-fit. Standardizes the case's own tumor
+intensities, assigns every tumor voxel to the nearest center, and emits a
+labeled habitat mask plus per-habitat volume fraction, dispersion,
+interface fraction, and raw channel statistics.
+"""
+timeout_secs = 3600
+artifact_prefix = "/artifacts/radiomics_habitat_assign"
+
+[nodes.ports]
+inputs = [{ type = "file" }, { type = "file" }, { type = "file" }]
+outputs = [
+  { path = "habitat_mask.mha", format = "mha" },
+  { path = "habitat_features.parquet", format = "parquet" },
+  { path = "assign_meta.json", format = "json" },
+]
+
+[nodes.params]
+mask_label = { type = "int", default = 1, min = 1.0, doc = "Positive tumor label inside the mask input" }
+
+[nodes.command]
+interpreter = "sh"
+script_file = "scripts/habitat_assign.sh"
+
+[nodes.command.env]
+RADIOMICS_MASK_LABEL = "{{ mask_label }}"
+
+[[nodes]]
+kind = "radiomics_perturb_stability"
+desc = "Re-extracts features under controlled perturbations."
+doc = """
+Applies controlled perturbations (one-voxel dilation/erosion, one-voxel
+mask translations, Gaussian noise at a percentage of the ROI SD) and
+re-runs PyRadiomics per replicate. Emits wide and long per-replicate
+feature tables; cohort-level ICC(2,1) is computed downstream in Rust from
+the stacked replicates.
+"""
+timeout_secs = 3600
+artifact_prefix = "/artifacts/radiomics_perturb_stability"
+
+[nodes.ports]
+inputs = [{ type = "file" }, { type = "file" }]
+outputs = [
+  { path = "replicates_wide.parquet", format = "parquet" },
+  { path = "replicates_long.parquet", format = "parquet" },
+  { path = "perturb_meta.json", format = "json" },
+]
+
+[nodes.params]
+extraction_id = { type = "string", doc = "Extraction unit identifier" }
+patient_id = { type = "string", doc = "Patient identifier recorded in the feature tables" }
+image_id = { type = "string", doc = "Image identifier recorded in the feature tables" }
+roi_id = { type = "string", doc = "ROI identifier recorded in the feature tables" }
+modality = { type = "string", doc = "Imaging modality, for example CT or MR" }
+preset_id = { type = "string", doc = "Preset identifier, for example pyradiomics_original_v1" }
+mask_label = { type = "int", default = 1, min = 1.0, doc = "Positive mask label that marks the ROI" }
+bin_width = { type = "number", default = 25.0, exclusive_min = 0.0, doc = "Fixed histogram bin width" }
+resampled_spacing = { type = "string", optional = true, doc = "Three space-separated positive spacings in millimeters to resample to before extraction" }
+force2d = { type = "bool", default = false, doc = "Extract 2D features slice by slice instead of volumetrically" }
+force2d_dimension = { type = "int", default = 0, max = 255.0, doc = "Axis along which force2d operates (0, 1, or 2)" }
+image_types = { type = "string_array", default = ["Original"], doc = "PyRadiomics image types to enable; supported: Original, LoG, Wavelet, Square, SquareRoot, Logarithm, Exponential, Gradient, LBP2D, LBP3D" }
+feature_classes = { type = "string_array", default = ["shape", "firstorder", "glcm", "glrlm", "glszm", "gldm", "ngtdm"], doc = "PyRadiomics feature classes to enable; PyRadiomics 3.1 supports shape, shape2D, firstorder, glcm, glrlm, glszm, gldm, ngtdm (NGLDM is not available)" }
+log_sigmas = { type = "string", default = "2 3 4 5", doc = "LoG kernel sigmas in millimeters as space-separated positive numbers; ignored unless LoG is enabled" }
+perturbations = { type = "string_array", default = ["dilate1", "erode1", "translate_x", "translate_y", "translate_z", "noise"], doc = "Controlled perturbations to replicate; subset of dilate1, erode1, translate_x, translate_y, translate_z, noise" }
+noise_sigma_pct = { type = "number", default = 2.0, exclusive_min = 0.0, doc = "Noise standard deviation as a percentage of the ROI intensity SD" }
+seed = { type = "int", default = 0, min = 0.0, doc = "Seed fixing the Gaussian noise field" }
+
+[nodes.command]
+interpreter = "sh"
+script_file = "scripts/perturb_stability.sh"
+
+[nodes.command.env]
+RADIOMICS_EXTRACTION_ID = "{{ extraction_id }}"
+RADIOMICS_PATIENT_ID = "{{ patient_id }}"
+RADIOMICS_IMAGE_ID = "{{ image_id }}"
+RADIOMICS_ROI_ID = "{{ roi_id }}"
+RADIOMICS_MODALITY = "{{ modality }}"
+RADIOMICS_PRESET_ID = "{{ preset_id }}"
+RADIOMICS_MASK_LABEL = "{{ mask_label }}"
+RADIOMICS_BIN_WIDTH = "{{ bin_width }}"
+RADIOMICS_RESAMPLED_SPACING = "{{ resampled_spacing }}"
+RADIOMICS_FORCE2D = "{{ force2d }}"
+RADIOMICS_FORCE2D_DIMENSION = "{{ force2d_dimension }}"
+RADIOMICS_IMAGE_TYPES = "{{ image_types }}"
+RADIOMICS_FEATURE_CLASSES = "{{ feature_classes }}"
+RADIOMICS_LOG_SIGMAS = "{{ log_sigmas }}"
+RADIOMICS_PERTURBATIONS = "{{ perturbations }}"
+RADIOMICS_NOISE_SIGMA_PCT = "{{ noise_sigma_pct }}"
+RADIOMICS_SEED = "{{ seed }}"
